@@ -361,7 +361,7 @@ function parseCSV(text){
 function normKey(k){ return (k||'').toString().trim().toLowerCase().replace(/[^a-z0-9]+/g,'_').replace(/^_|_$/g,''); }
 
 const COL_ALIASES = {
-  po:['po','po_number','po_num','po_no','purchase_order','order_number','order_id'],
+  po:['po','po_number','po_num','po_no','purchase_order','order_number','order_id','receiving_reference_1','receiving_reference','reference_1','ref_1'],
   org:['org','organization','organisation','customer','company','account'],
   category:['category','product_category','type','cat'],
   qty:['qty','quantity','units','count'],
