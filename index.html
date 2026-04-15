@@ -75,6 +75,21 @@
   .collapsible-body.collapsed{max-height:0!important}
   @media(max-width:900px){.charts-row{grid-template-columns:1fr}.kpi-row{grid-template-columns:repeat(2,1fr)}}
   @media(max-width:600px){.kpi-row{grid-template-columns:1fr}.container{padding:12px}}
+
+  /* Upload bar */
+  .upload-bar{display:flex;align-items:center;gap:12px;padding:14px 16px;background:#fff;border:1px dashed var(--gray-300);border-radius:10px;margin-bottom:20px;flex-wrap:wrap}
+  .upload-bar .upload-label{font-size:13px;color:var(--gray-600);font-weight:500}
+  .upload-bar .upload-btn{display:inline-flex;align-items:center;gap:6px;padding:8px 16px;background:var(--blue);color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;transition:background 0.2s}
+  .upload-bar .upload-btn:hover{background:#2563eb}
+  .upload-bar .upload-btn.secondary{background:#fff;color:var(--gray-700);border:1px solid var(--gray-300)}
+  .upload-bar .upload-btn.secondary:hover{background:var(--gray-50)}
+  .upload-bar input[type=file]{display:none}
+  .upload-bar .upload-status{font-size:12px;color:var(--gray-500);margin-left:auto}
+  .upload-bar .upload-status.success{color:#15803d}
+  .upload-bar .upload-status.error{color:#dc2626}
+  .upload-bar details{font-size:12px;color:var(--gray-500);width:100%}
+  .upload-bar details summary{cursor:pointer;color:var(--blue)}
+  .upload-bar details .hint{margin-top:8px;padding:10px;background:var(--gray-50);border-radius:6px;font-family:ui-monospace,monospace;font-size:11px;color:var(--gray-700);white-space:pre-wrap;line-height:1.6}
 </style>
 </head>
 <body>
@@ -93,6 +108,24 @@
   <div class="wh-tabs">
     <div class="wh-tab active" data-wh="coventry" onclick="setWarehouse('coventry')">Coventry UK</div>
     <div class="wh-tab" data-wh="germany" onclick="setWarehouse('germany')">Germany EU</div>
+  </div>
+
+  <div class="upload-bar">
+    <span class="upload-label">Update <strong id="activeWhName">Coventry UK</strong> data:</span>
+    <label class="upload-btn" for="csvInput">
+      &#8679; Upload CSV
+      <input type="file" id="csvInput" accept=".csv,text/csv" onchange="handleCsvUpload(event)">
+    </label>
+    <button class="upload-btn secondary" onclick="resetWarehouseData()">Reset to original</button>
+    <span class="upload-status" id="uploadStatus"></span>
+    <details>
+      <summary>Expected CSV columns</summary>
+      <div class="hint">Required (case-insensitive, flexible names): po, organization, category, qty, wh_received (YYYY-MM-DD), fb_inbounded (YYYY-MM-DD)
+Optional: business_days, calendar_days (auto-computed from dates if missing)
+
+Example header row:
+po,organization,category,qty,wh_received,fb_inbounded,business_days,calendar_days</div>
+    </details>
   </div>
 
   <div class="year-tabs">
@@ -289,6 +322,216 @@ function toggleAllPos(){
   const body=document.getElementById('allPosBody'),icon=document.getElementById('allPosToggle');
   body.classList.toggle('collapsed'); icon.classList.toggle('open');
 }
+
+// --- CSV upload handling --------------------------------------------------
+const ORIGINAL_WAREHOUSES = JSON.parse(JSON.stringify(WAREHOUSES));
+
+function parseCSV(text){
+  // Simple CSV parser that handles quoted fields with commas and escaped quotes.
+  const rows=[]; let row=[], field='', inQ=false;
+  for(let i=0;i<text.length;i++){
+    const c=text[i];
+    if(inQ){
+      if(c==='"' && text[i+1]==='"'){field+='"';i++;}
+      else if(c==='"'){inQ=false;}
+      else{field+=c;}
+    } else {
+      if(c==='"'){inQ=true;}
+      else if(c===','){row.push(field);field='';}
+      else if(c==='\n'){row.push(field);rows.push(row);row=[];field='';}
+      else if(c==='\r'){/* ignore */}
+      else{field+=c;}
+    }
+  }
+  if(field.length||row.length){row.push(field);rows.push(row);}
+  return rows.filter(r=>r.length>1 || (r.length===1 && r[0].trim()!==''));
+}
+
+function normKey(k){ return (k||'').toString().trim().toLowerCase().replace(/[^a-z0-9]+/g,'_').replace(/^_|_$/g,''); }
+
+const COL_ALIASES = {
+  po:['po','po_number','po_num','po_no','purchase_order','order_number','order_id'],
+  org:['org','organization','organisation','customer','company','account'],
+  category:['category','product_category','type','cat'],
+  qty:['qty','quantity','units','count'],
+  wh_received:['wh_received','warehouse_received','received','received_at','received_date','wh_receipt','receipt_date','date_received'],
+  fb_inbounded:['fb_inbounded','firstbase_inbounded','inbounded','inbounded_at','inbound_date','inbounded_date','date_inbounded'],
+  business_days:['business_days','bd','biz_days','working_days'],
+  calendar_days:['calendar_days','cal_days','days','elapsed_days']
+};
+
+function buildColumnMap(header){
+  const h=header.map(normKey);
+  const map={};
+  for(const [target,aliases] of Object.entries(COL_ALIASES)){
+    for(const a of aliases){
+      const idx=h.indexOf(a);
+      if(idx!==-1){map[target]=idx;break;}
+    }
+  }
+  return map;
+}
+
+function parseDate(s){
+  if(!s) return null;
+  s=s.toString().trim();
+  // ISO YYYY-MM-DD
+  let m=s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if(m) return new Date(Date.UTC(+m[1],+m[2]-1,+m[3]));
+  // DD/MM/YYYY or MM/DD/YYYY — assume DD/MM/YYYY (UK/EU bias)
+  m=s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+  if(m){
+    const a=+m[1],b=+m[2],y=+m[3];
+    // If first value >12 it must be day
+    if(a>12) return new Date(Date.UTC(y,b-1,a));
+    // Otherwise assume DD/MM
+    return new Date(Date.UTC(y,b-1,a));
+  }
+  const d=new Date(s);
+  return isNaN(d.getTime())?null:d;
+}
+
+function fmtDate(d){
+  if(!d) return '';
+  const y=d.getUTCFullYear(), m=String(d.getUTCMonth()+1).padStart(2,'0'), day=String(d.getUTCDate()).padStart(2,'0');
+  return `${y}-${m}-${day}`;
+}
+
+function businessDaysBetween(a,b){
+  if(!a||!b) return 0;
+  let start=new Date(a.getTime()), end=new Date(b.getTime());
+  if(end<start){const t=start;start=end;end=t;}
+  let days=0;
+  const cur=new Date(start.getTime());
+  while(cur<end){
+    cur.setUTCDate(cur.getUTCDate()+1);
+    const dow=cur.getUTCDay();
+    if(dow!==0 && dow!==6) days++;
+  }
+  return days;
+}
+
+function buildWarehouseDataFromRows(rows){
+  if(!rows.length) throw new Error('CSV is empty');
+  const header=rows[0];
+  const colmap=buildColumnMap(header);
+  const required=['po','wh_received','fb_inbounded'];
+  const missing=required.filter(r=>!(r in colmap));
+  if(missing.length) throw new Error('Missing required columns: '+missing.join(', '));
+
+  const all_pos=[];
+  for(let i=1;i<rows.length;i++){
+    const r=rows[i]; if(!r || r.every(c=>!c||!c.toString().trim())) continue;
+    const get=k=>colmap[k]!=null?(r[colmap[k]]||'').toString().trim():'';
+    const whD=parseDate(get('wh_received'));
+    const fbD=parseDate(get('fb_inbounded'));
+    if(!whD||!fbD) continue;
+    let bd=get('business_days');
+    bd=bd===''?businessDaysBetween(whD,fbD):Number(bd);
+    if(isNaN(bd)) bd=businessDaysBetween(whD,fbD);
+    let cd=get('calendar_days');
+    cd=cd===''?Math.round((fbD-whD)/86400000):Number(cd);
+    if(isNaN(cd)) cd=Math.round((fbD-whD)/86400000);
+    const qtyRaw=get('qty');
+    const qty=qtyRaw===''?0:Number(qtyRaw)||0;
+    all_pos.push({
+      po:get('po'),
+      org:get('org')||'Unknown',
+      category:get('category')||'Unknown',
+      qty,
+      wh_received:fmtDate(whD),
+      fb_inbounded:fmtDate(fbD),
+      business_days:bd,
+      calendar_days:cd,
+      met_slo:bd<=2
+    });
+  }
+  if(!all_pos.length) throw new Error('No valid rows parsed from CSV');
+
+  // Monthly aggregation
+  const byMonth={};
+  all_pos.forEach(p=>{
+    const m=p.wh_received.slice(0,7);
+    if(!byMonth[m]) byMonth[m]={month:m,total:0,met:0,missed:0,days:[],maxd:0};
+    const b=byMonth[m];
+    b.total++; if(p.met_slo) b.met++; else b.missed++;
+    b.days.push(p.business_days); if(p.business_days>b.maxd) b.maxd=p.business_days;
+  });
+  const monthly=Object.values(byMonth).sort((a,b)=>a.month.localeCompare(b.month)).map(b=>{
+    const sorted=b.days.slice().sort((x,y)=>x-y);
+    const avg=sorted.reduce((a,c)=>a+c,0)/sorted.length;
+    return {
+      month:b.month,total:b.total,met:b.met,missed:b.missed,
+      pct:Math.round(b.met/b.total*1000)/10,
+      avg_days:Math.round(avg*10)/10,
+      max_days:b.maxd,
+      median_days:sorted[Math.floor(sorted.length/2)]
+    };
+  });
+
+  // Summary
+  const bds=all_pos.map(p=>p.business_days).sort((a,b)=>a-b);
+  const met=all_pos.filter(p=>p.met_slo).length;
+  const summary={
+    total_matched:all_pos.length,
+    met_slo:met,
+    missed_slo:all_pos.length-met,
+    slo_pct:Math.round(met/all_pos.length*1000)/10,
+    avg_business_days:Math.round(bds.reduce((a,b)=>a+b,0)/bds.length*10)/10,
+    median_business_days:bds[Math.floor(bds.length/2)],
+    p90_business_days:bds[Math.floor(bds.length*.9)],
+    max_business_days:bds[bds.length-1]
+  };
+
+  // Worst offenders: missed SLOs, top 25 by business days
+  const worst_offenders=all_pos
+    .filter(p=>!p.met_slo)
+    .sort((a,b)=>b.business_days-a.business_days)
+    .slice(0,25);
+
+  return {summary,monthly,all_pos,worst_offenders};
+}
+
+function setUploadStatus(msg,kind){
+  const el=document.getElementById('uploadStatus');
+  el.textContent=msg||'';
+  el.className='upload-status'+(kind?' '+kind:'');
+}
+
+function handleCsvUpload(ev){
+  const file=ev.target.files && ev.target.files[0];
+  if(!file) return;
+  const reader=new FileReader();
+  reader.onload=e=>{
+    try{
+      const rows=parseCSV(e.target.result);
+      const data=buildWarehouseDataFromRows(rows);
+      WAREHOUSES[currentWH]=data;
+      setUploadStatus('Loaded '+data.all_pos.length+' POs from '+file.name,'success');
+      renderAll();
+    }catch(err){
+      console.error(err);
+      setUploadStatus('Error: '+err.message,'error');
+    }
+    ev.target.value='';
+  };
+  reader.onerror=()=>setUploadStatus('Failed to read file','error');
+  reader.readAsText(file);
+}
+
+function resetWarehouseData(){
+  WAREHOUSES[currentWH]=JSON.parse(JSON.stringify(ORIGINAL_WAREHOUSES[currentWH]));
+  setUploadStatus('Reset to original data','success');
+  renderAll();
+}
+
+// Update active warehouse name label on tab change
+const _origSetWarehouse=setWarehouse;
+setWarehouse=function(wh){
+  _origSetWarehouse(wh);
+  document.getElementById('activeWhName').textContent=wh==='coventry'?'Coventry UK':'Germany EU';
+  setUploadStatus('');
+};
 
 renderAll();
 </script>
